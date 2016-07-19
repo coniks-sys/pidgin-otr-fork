@@ -68,6 +68,9 @@
 #include "ui.h"
 #include "otr-icons.h"
 
+/* coniks headers */
+#include "coniks_buddy_check.h"
+
 static GHashTable * otr_win_menus = 0;
 static GHashTable * otr_win_status = 0;
 
@@ -1745,6 +1748,27 @@ static void socialist_millionaires(GtkWidget *widget, gpointer data)
     otrg_gtk_dialog_socialist_millionaires(context, NULL, FALSE);
 }
 
+/* Called when Coniks verification is selected from menu */
+static void coniks_continuity_checks(GtkWidget *widget, gpointer data)
+{
+    ConvOrContext *convctx = data;
+    PurpleConversation *conv;
+    ConnContext *context = NULL;
+
+    if (convctx->convctx_type == convctx_conv) {
+	conv = convctx->conv;
+	context = otrg_plugin_conv_to_selected_context(conv, 0);
+    } else if (convctx->convctx_type == convctx_ctx) {
+	context = convctx->context;
+    }
+
+    if (context == NULL || context->msgstate != OTRL_MSGSTATE_ENCRYPTED)
+	return;
+
+    otrg_plugin_coniks_continuity_checks_buddy(context);
+
+}
+
 static void menu_whatsthis(GtkWidget *widget, gpointer data)
 {
     char *uri = g_strdup_printf("%s%s", LEVELS_HELPURL, _("?lang=en"));
@@ -2048,8 +2072,10 @@ static void build_otr_menu(ConvOrContext *convctx, GtkWidget *menu,
 	GTK_SIGNAL_FUNC(otrg_gtk_dialog_clicked_connect), conv);
     gtk_signal_connect(GTK_OBJECT(buddymenuend), "activate",
 	GTK_SIGNAL_FUNC(menu_end_private_conversation), convctx);
+    /*gtk_signal_connect(GTK_OBJECT(buddymenusmp), "activate",
+      GTK_SIGNAL_FUNC(socialist_millionaires), convctx);*/
     gtk_signal_connect(GTK_OBJECT(buddymenusmp), "activate",
-	GTK_SIGNAL_FUNC(socialist_millionaires), convctx);
+	GTK_SIGNAL_FUNC(coniks_continuity_checks), convctx);
 
 }
 

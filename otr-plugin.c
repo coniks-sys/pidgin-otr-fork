@@ -76,6 +76,12 @@
 #include "dialogs.h"
 #include "otr-plugin.h"
 
+/* coniks otr headers */
+#include "keypair.h"
+#include "coniks.h"
+#include "util.pb-c.h"
+#include "c2s.pb-c.h"
+
 #ifdef USING_GTK
 /* purple-otr GTK headers */
 #include <glib.h>
@@ -110,10 +116,14 @@ PurplePlugin *otrg_plugin_handle;
 /* We'll only use the one OtrlUserState. */
 OtrlUserState otrg_plugin_userstate = NULL;
 
+/* We'll only use on ConiksOtrState. */
+ConiksOtrState coniks_state = NULL;
+
 /* GLib HashTable for storing the maximum message size for various
  * protocols. */
 GHashTable* mms_table = NULL;
 
+static void otrg_plugin_coniks_continuity_checks_self(char *accountname);
 
 /* Send an IM from the given account to the given recipient.  Display an
  * error dialog if that account isn't currently logged in. */
@@ -135,6 +145,29 @@ void otrg_plugin_inject_message(PurpleAccount *account, const char *recipient,
 	g_free(msg);
 	return;
     }
+
+    // all this for self check
+    const char *accountname, *proto;
+    accountname = purple_account_get_username(account);
+    proto = purple_account_get_protocol_id(account);
+
+    // Needed so we can send the username via the proto (does not have const char * name)
+    size_t uname_len = strlen(accountname);
+    char *uname = malloc(uname_len);
+    strcpy(uname, accountname);
+
+    // only check logged in user if she has a public key and she hasn't checked
+    // its continuity yet in this session or epoch
+    if (otrl_privkey_find(otrg_plugin_userstate, accountname, proto) != NULL && 
+        coniks_state->check_status == unchecked_stat 
+        /* || (coniks_state->check_status == done_stat && 
+           get_current_time_millis() >= coniks_state->last_epoch + coniks_state->serv_epoch_interval))*/) {
+      coniks_state->check_status = in_prog_stat;
+      otrg_plugin_coniks_continuity_checks_self(uname);
+    } 
+
+    free(uname);
+
     serv_send_im(connection, recipient, message, 0);
 }
 
@@ -232,14 +265,81 @@ void otrg_plugin_create_privkey(const char *accountname,
 
     waithandle = otrg_dialog_private_key_wait_start(accountname, protocol);
 
-    /* Generate the key */
-    otrl_privkey_generate_FILEp(otrg_plugin_userstate, privf,
-	    accountname, protocol);
+    char *pubkey, *uname;
+
+    // Needed so we can send the username via the proto (does not have const char * name)
+    size_t uname_len = strlen(accountname);
+    uname = malloc(uname_len);
+    strcpy(uname, accountname);
+
+    /* Generate the keypair */
+    coniks_otr_keypair_generate_FILEp_str(otrg_plugin_userstate, privf,
+                                      accountname, protocol, &pubkey);
     fclose(privf);
     otrg_ui_update_fingerprint();
+      
+    /* register the public key and name with the server */
+    // cache the returned initial epoch and epoch interval for future continuity checks
+    uint8_t resp;
+    uint8_t *msg_data;
+    size_t len;
+    Protos__ServerResp *serv_resp;
+    Protos__RegistrationResp *reg_resp = NULL;
+    resp = register_key(uname, pubkey, &msg_data, &len);
 
-    /* Mark the dialog as done. */
-    otrg_dialog_private_key_wait_done(waithandle);
+    char err_buf[150];
+    if(resp == server_resp_m){
+      serv_resp = protos__server_resp__unpack(NULL, len, msg_data);   
+      if (serv_resp == NULL){
+        sprintf(err_buf, "resp: error unpacking incoming message.");
+        purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Key Registration", err_buf, NULL, NULL, NULL);
+        return;
+      }
+      
+      /* Mark the dialog as done but an error occurred. */
+      otrg_dialog_private_key_wait_done(waithandle);
+
+      if(serv_resp->has_message && 
+         serv_resp->message == PROTOS__SERVER_RESP__MESSAGE__NAME_EXISTS_ERR){
+        purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Key Registration", "The server already has a registered key under your name", NULL, NULL, NULL);  
+        return;
+      }
+      else{
+        purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Key Registration", "Something went wrong", NULL, NULL, NULL);
+        return;
+      }
+    }
+    else if(resp == registration_resp_m){
+      reg_resp = protos__registration_resp__unpack(NULL, len, msg_data);   
+      if (reg_resp == NULL){
+        sprintf(err_buf, "resp: error unpacking incoming message.");
+        purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Key Registration", err_buf, NULL, NULL, NULL);
+        return;
+      }
+      
+      if(reg_resp->has_init_epoch && reg_resp->has_epoch_interval) {
+        // now we can update the server params in the coniks state and save the new state
+        set_server_params(coniks_state, uname, reg_resp->init_epoch, reg_resp->epoch_interval);
+        gchar *coniksservfile = g_build_filename(purple_user_dir(), CONIKSSERVFNAME, NULL);
+        gcry_error_t err = write_server_params(coniks_state, coniksservfile); 
+        
+        if (err) {
+          purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Key Registration", gcry_strerror(err), NULL, NULL, NULL);
+          return;
+        }
+      }
+      /* Mark the dialog as done. */
+      otrg_dialog_private_key_wait_done(waithandle);
+  }
+  else{
+    sprintf(err_buf, "Bad server response");
+    purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Public key lookup", err_buf, NULL, NULL, NULL);
+    return;
+  }
+
+    free(uname);
+    free(pubkey);
+
 }
 
 static void create_privkey_cb(void *opdata, const char *accountname,
@@ -791,7 +891,375 @@ void otrg_plugin_send_default_query_conv(PurpleConversation *conv)
     msg = otrl_proto_default_query_msg(accountname, prefs.policy);
     otrg_plugin_inject_message(account, username, msg ? msg : "?OTRv23?");
     free(msg);
+
 }
+
+static int plugin_get_commitment(uint64_t epoch, uint8_t **comm_msg_data, size_t *msg_data_len){
+  uint8_t resp;
+  uint8_t *msg_data;
+  size_t len;
+  Protos__ServerResp *serv_resp;
+  Protos__Commitment *comm;
+  
+  printf("otr-plugin: retrieving the commitment\n");
+  
+  char *server;
+  get_server_name(coniks_state->accountname, &server);
+
+  resp = get_commitment(PROTOS__COMMITMENT_REQ__COMMITMENT_TYPE__SELF, epoch, 
+                        server, &msg_data, &len);
+  
+  if(resp == server_resp_m){    
+    serv_resp = protos__server_resp__unpack(NULL, len, msg_data);   
+    if (serv_resp == NULL){
+      return -1;
+    }
+    
+    if(serv_resp->has_message){
+      protos__server_resp__free_unpacked(serv_resp, NULL);
+      return 0;
+    }
+    else{
+      protos__server_resp__free_unpacked(serv_resp, NULL);
+      return -2;
+    }
+  }
+  else if(resp == commitment_resp_m){
+    comm = protos__commitment__unpack(NULL, len, msg_data);   
+    if (comm == NULL){
+      return -3;
+    }
+
+    if(!comm->has_epoch){
+      return -4;
+    }
+  }
+  else{
+    return -5;
+  }
+  
+  printf("otr-plugin: commitment data seems fine\n");
+  
+  // we got here so we know the message data is good
+  *comm_msg_data = malloc(len);
+
+  if(*comm_msg_data == NULL){
+    return -6;
+  }
+  else{
+    memcpy(*comm_msg_data, msg_data, len);
+    *msg_data_len = len;
+  }
+
+  return 1;
+}
+
+static int plugin_get_public_key(char *accountname, uint64_t epoch_date, uint8_t **ap_msg_data, size_t *msg_data_len){
+
+  uint8_t resp;
+  uint8_t *msg_data;
+  size_t len;
+  Protos__ServerResp *serv_resp;
+  Protos__AuthPath *auth_path;
+  
+  resp = get_public_key(accountname, epoch_date, &msg_data, &len); // TODO: find a better way to get most recent version
+
+  if(resp == server_resp_m){
+    serv_resp = protos__server_resp__unpack(NULL, len, msg_data);   
+    if (serv_resp == NULL){
+      return -1;
+    }
+    
+    if(serv_resp->has_message && 
+       serv_resp->message == PROTOS__SERVER_RESP__MESSAGE__NAME_NOT_FOUND_ERR){
+      protos__server_resp__free_unpacked(serv_resp, NULL);
+      return 0;
+    }
+    else{
+      protos__server_resp__free_unpacked(serv_resp, NULL);
+      return -2;
+    }
+  }
+  else if(resp == auth_path_m){
+    auth_path = protos__auth_path__unpack(NULL, len, msg_data);   
+    if (auth_path == NULL){
+      return -3;
+    }
+
+  }
+  else{
+    
+    return -4;
+  }
+
+  // we got here so we know the message data is good
+  *ap_msg_data = malloc(len);
+  
+  if(*ap_msg_data == NULL){
+    return -6;
+  }
+  else{
+    memcpy(*ap_msg_data, msg_data, len);
+    *msg_data_len = len;
+  }
+  
+  return 1;
+  
+}
+
+/* Actually perform the continuity checks */
+static gboolean do_continuity_checks_self(Protos__Commitment *comm, Protos__AuthPath *auth_path){
+  // first check the hash chain, for this retrieve the previous commitment and get its root hash
+  Protos__AuthPath__RootNode *cur_root;
+  cur_root = auth_path->root;
+
+  uint64_t last_epoch;
+
+  // have we ever checked ourselves before?
+  if(coniks_state->last_epoch == 0){
+    // no, otherwise this value would have been initialized in plugin-load
+    // this is actually my initial epoch with the server
+    last_epoch = coniks_state->serv_init_epoch; // server epoch numbers start at some non-zero number
+  }
+  else{
+    last_epoch = coniks_state->last_epoch;
+  }
+
+  uint64_t diff = comm->epoch - last_epoch;
+  int eq_res, val_res;  
+  char err_msg[1500];
+
+  if(diff == 0){
+    printf("otr-plugin: first equivocation check for epoch %lu\n", comm->epoch);
+    eq_res = coniks_non_equivocation_check(coniks_state, comm, NULL, cur_root, err_msg);
+
+    if(!eq_res){
+      return 0;
+    }
+    else{
+      val_res = coniks_validity_check(comm, auth_path, err_msg);
+      return val_res;
+    }
+  }
+  else if(diff > 0){
+    Protos__Commitment *cur_comm = comm;
+    Protos__AuthPath *cur_authPath = auth_path;
+    Protos__Commitment *prev_comm;
+
+     printf("otr-plugin: starting epoch: %lu\n", comm->epoch);
+
+    uint64_t ep;
+    for(ep = comm->epoch; ep > last_epoch; ){
+        printf("otr-plugin: current epoch: %lu\n", ep);
+    
+      uint8_t *msg_data;
+      size_t msg_data_len;
+
+      if(ep < comm->epoch){
+        // only get the next authentication path if we're past the first iteration
+        int ret = plugin_get_public_key(coniks_state->accountname, ep, &msg_data, 
+                                        &msg_data_len);
+        
+        if(ret != 1){
+          return 0;
+        }
+        
+        cur_authPath = protos__auth_path__unpack(NULL, msg_data_len, msg_data);   
+        if (cur_authPath == NULL){
+          return 0;
+        }
+        
+        cur_root = cur_authPath->root;
+
+        free(msg_data);
+      }
+
+      // get the commitment for the previous epoch so we can check the commitment 
+      // history
+      int ret = plugin_get_commitment(ep-coniks_state->serv_epoch_interval, 
+                                      &msg_data, &msg_data_len);
+
+      if(ret != 1){
+        return 0;
+      }
+
+      prev_comm = protos__commitment__unpack(NULL, msg_data_len, msg_data);   
+      if (prev_comm == NULL){
+        return 0;
+      }
+
+      free(msg_data);
+      
+      printf("otr-plugin: before equivocation check in loop\n");
+
+      eq_res = coniks_non_equivocation_check(coniks_state, cur_comm, prev_comm, 
+                                             cur_root, err_msg);
+
+      if(!eq_res){
+        return 0;
+      }
+      
+       printf("otr-plugin: equivocation check passed\n");
+      
+      val_res = coniks_validity_check(cur_comm, cur_authPath, err_msg);
+
+      if(!val_res){
+        return 0;
+      }
+
+      printf("otr-plugin: validity check passed\n");
+
+      cur_comm = prev_comm;
+      ep = prev_comm->epoch;
+      
+    }
+
+    //at this point cur_comm should be equal to last_comm, so let's perform 
+    // this equality check...
+    if (coniks_state->last_comm == NULL){
+      // ...unless we've never checked ourselves, then we *have* to trust our provider
+      return 1;
+    }
+    else if (coniks_state->last_epoch != cur_comm->epoch) {
+      return 0;
+    }
+
+    int all_good;
+    all_good =  compare_commitments(coniks_state->last_comm, cur_comm);
+
+    printf("otr-plugin: checking that stored commitment is consistent with recv comm\n");
+
+    return all_good;
+  }
+  
+  // we should really never get here
+  return 0;
+
+}
+
+/* Retrieves all necessary information to perform the coniks continuity checks on the requested user 
+* for the current epoch */
+static void otrg_plugin_coniks_continuity_checks_self(char *accountname)
+{
+  // key lookup
+  uint8_t resp;
+  uint8_t *msg_data;
+  size_t len;
+  Protos__ServerResp *serv_resp;
+  Protos__AuthPath *auth_path = NULL;
+  Protos__Commitment *comm = NULL;
+
+  uint64_t current_time = get_current_time_millis();
+
+  // retrieve the most recent public key for myself
+  char err_buf[150];
+  resp = get_public_key(accountname, current_time, &msg_data, &len);  // this helps us report error messages to the user according to the server response
+
+  coniks_state->accountname = accountname;
+
+  OtrgDialogWaitHandle waithandle;
+
+  if(resp == server_resp_m){
+    serv_resp = protos__server_resp__unpack(NULL, len, msg_data);   
+    if (serv_resp == NULL){
+      sprintf(err_buf, "resp: error unpacking incoming message.");
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Public Key Lookup", err_buf, NULL, NULL, NULL);
+      goto out_err;
+    }
+    
+    if(serv_resp->has_message && 
+       serv_resp->message == PROTOS__SERVER_RESP__MESSAGE__NAME_NOT_FOUND_ERR){
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Public Key Lookup", "The server couldn't find your name.", "If you generated your public key less than an hour ago, the server has not published a snapshot that includes your key yet. Your key will appear within the hour. If you have not generated a public key, please go to Configure Plugin.", NULL, NULL);  
+      goto out_err;
+    }
+    else{
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Public Key Lookup", "Something went wrong", NULL, NULL, NULL);
+      goto out_err;
+    }
+  }
+  else if(resp == auth_path_m){
+    auth_path = protos__auth_path__unpack(NULL, len, msg_data);   
+    if (auth_path == NULL){
+      sprintf(err_buf, "resp: error unpacking incoming message.");
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Public Key Lookup", err_buf, NULL, NULL, NULL);
+      goto out_err;
+    }
+    
+    if (auth_path->leaf == NULL) {
+        printf("otr-plugin: uhhh...\n");
+    }
+
+  }
+  else{
+    sprintf(err_buf, "Bad server response");
+    purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Public key lookup", err_buf, NULL, NULL, NULL);
+    goto out_err;
+  }
+
+  // get the server's name
+  char *server;
+  get_server_name(accountname, &server);
+
+  resp = get_commitment(PROTOS__COMMITMENT_REQ__COMMITMENT_TYPE__SELF, current_time, 
+                        server, &msg_data, &len);
+  
+  if(resp == server_resp_m){    
+    serv_resp = protos__server_resp__unpack(NULL, len, msg_data);   
+    if (serv_resp == NULL){
+      sprintf(err_buf, "resp: error unpacking incoming message.");
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Commitment retrieval", err_buf, NULL, NULL, NULL);
+      goto out_err;
+    }
+    
+    if(serv_resp->has_message){
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Commitment retrieval", "Server error", NULL, NULL, NULL);
+      goto out_err;
+    }
+  }
+  else if(resp == commitment_resp_m){
+    comm = protos__commitment__unpack(NULL, len, msg_data);   
+    if (comm == NULL){
+      sprintf(err_buf, "resp: error unpacking incoming message.");
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Commitment retrieval", err_buf, NULL, NULL, NULL);
+      goto out_err;
+    }
+
+    if(!comm->has_epoch){
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Commitment retrieval", "No epoch", NULL, NULL, NULL);
+      goto out_err;
+    }
+  }
+  else{
+    sprintf(err_buf, "Bad server response");
+    printf("otr-plugin: server's bad response: %d\n", resp);
+    purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Commitment retrieval", err_buf, NULL, NULL, NULL);
+    goto out_err;
+    } 
+
+  // now call the actual do_check function
+  gboolean check_passed = do_continuity_checks_self(comm, auth_path);
+
+  if(check_passed && coniks_state->check_status == in_prog_stat){
+    // now we can update the coniks state and save the new state
+    update_coniks_state(coniks_state, accountname, comm);
+    gchar *coniksfile = g_build_filename(purple_user_dir(), CONIKSFNAME, NULL);
+    gcry_error_t err = write_coniks_state(coniks_state, coniksfile); 
+
+    if (err) {
+      purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Continuity Self Checks", gcry_strerror(err), NULL, NULL, NULL);
+      goto out_err;
+    }
+  
+  }
+  else{
+    purple_notify_message(otrg_plugin_handle, PURPLE_NOTIFY_MSG_INFO, "Continuity Self Checks", "Malicious server behavior suspected. Use your secure identity with caution.", NULL, NULL, NULL);
+  }
+
+ out_err:;
+  return;
+
+}
+
 
 static gboolean process_receiving_im(PurpleAccount *account, char **who,
 	char **message, int *flags, void *m)
@@ -1164,7 +1632,7 @@ static void otrg_init_mms_table()
     } mmsPairs[] = {{"prpl-msn", 1409}, {"prpl-icq", 2346},
 	{"prpl-aim", 2343}, {"prpl-yahoo", 799}, {"prpl-gg", 1999},
 	{"prpl-irc", 417}, {"prpl-oscar", 2343},
-	{"prpl-novell", 1792}, {NULL, 0}};
+        {"prpl-novell", 1792}, {NULL, 0}};
     int i = 0;
     gchar *maxmsgsizefile;
     FILE *mmsf;
@@ -1202,9 +1670,11 @@ static void otrg_free_mms_table()
 static gboolean otr_plugin_load(PurplePlugin *handle)
 {
     gchar *privkeyfile = g_build_filename(purple_user_dir(), PRIVKEYFNAME,
-	    NULL);
+           NULL);
     gchar *storefile = g_build_filename(purple_user_dir(), STOREFNAME, NULL);
     gchar *instagfile = g_build_filename(purple_user_dir(), INSTAGFNAME, NULL);
+    gchar *coniksfile = g_build_filename(purple_user_dir(), CONIKSFNAME, NULL);
+    gchar *coniksservfile = g_build_filename(purple_user_dir(), CONIKSSERVFNAME, NULL);
     void *conv_handle = purple_conversations_get_handle();
     void *conn_handle = purple_connections_get_handle();
     void *blist_handle = purple_blist_get_handle();
@@ -1212,6 +1682,8 @@ static gboolean otr_plugin_load(PurplePlugin *handle)
     FILE *privf;
     FILE *storef;
     FILE *instagf;
+    FILE *coniksf;
+    FILE *serverf;
 #if BETA_DIALOG && defined USING_GTK /* Only for beta */
     GtkWidget *dialog;
     GtkWidget *dialog_text;
@@ -1219,10 +1691,12 @@ static gboolean otr_plugin_load(PurplePlugin *handle)
     gchar * buf = NULL;
 #endif
 
-    if (!privkeyfile || !storefile || !instagfile) {
+    if (!privkeyfile || !storefile || !instagfile || !coniksfile || !coniksservfile) {
 	g_free(privkeyfile);
 	g_free(storefile);
 	g_free(instagfile);
+        g_free(coniksfile);
+        g_free(coniksservfile);
 	return 0;
     }
 
@@ -1254,6 +1728,8 @@ static gboolean otr_plugin_load(PurplePlugin *handle)
 	g_free(privkeyfile);
 	g_free(storefile);
 	g_free(instagfile);
+        g_free(coniksfile);
+        g_free(coniksservfile);
 	return 0;
     }
 
@@ -1282,9 +1758,13 @@ static gboolean otr_plugin_load(PurplePlugin *handle)
     privf = g_fopen(privkeyfile, "rb");
     storef = g_fopen(storefile, "rb");
     instagf = g_fopen(instagfile, "rb");
+    coniksf = g_fopen(coniksfile, "rb");
+    serverf = g_fopen(coniksservfile, "rb");
     g_free(privkeyfile);
     g_free(storefile);
     g_free(instagfile);
+    g_free(coniksfile);
+    g_free(coniksservfile);
 
     otrg_init_mms_table();
 
@@ -1292,6 +1772,7 @@ static gboolean otr_plugin_load(PurplePlugin *handle)
 
     /* Make our OtrlUserState; we'll only use the one. */
     otrg_plugin_userstate = otrl_userstate_create();
+    coniks_state = create_coniks_state();
 
     otrg_plugin_timerid = 0;
 
@@ -1299,11 +1780,18 @@ static gboolean otr_plugin_load(PurplePlugin *handle)
     otrl_privkey_read_fingerprints_FILEp(otrg_plugin_userstate, storef,
 	    NULL, NULL);
     otrl_instag_read_FILEp(otrg_plugin_userstate, instagf);
+    read_coniks_state_FILEp(coniks_state, coniksf);
+    read_server_params_FILEp(coniks_state, serverf);
+
     if (privf) fclose(privf);
     if (storef) fclose(storef);
     if (instagf) fclose(instagf);
+    if (coniksf) fclose(coniksf);
+    if (serverf) fclose(serverf);
 
     otrg_ui_update_fingerprint();
+
+    // move self checks to inject_message
 
     purple_signal_connect(core_handle, "quitting", otrg_plugin_handle,
 	    PURPLE_CALLBACK(process_quitting), NULL);
@@ -1369,7 +1857,9 @@ static gboolean otr_plugin_unload(PurplePlugin *handle)
     stop_start_timer(0);
 
     otrl_userstate_free(otrg_plugin_userstate);
+    destroy_coniks_state(coniks_state);
     otrg_plugin_userstate = NULL;
+    coniks_state = NULL;
 
     otrg_free_mms_table();
 
@@ -1414,13 +1904,13 @@ static PurplePluginInfo info =
 	0,                                                /* flags          */
 	NULL,                                             /* dependencies   */
 	PURPLE_PRIORITY_DEFAULT,                          /* priority       */
-	"otr",                                            /* id             */
+	"coniks-otr",                                     /* id             */
 	NULL,                                             /* name           */
 	PIDGIN_OTR_VERSION,                               /* version        */
 	NULL,                                             /* summary        */
 	NULL,                                             /* description    */
 							  /* author         */
-	"Ian Goldberg, Rob Smits,\n"
+        "Ian Goldberg, Rob Smits,\n"
 	    "\t\t\tChris Alexander, Willy Lew, Lisa Du,\n"
 	    "\t\t\tNikita Borisov <otr@cypherpunks.ca>",
 	"https://otr.cypherpunks.ca/",                    /* homepage       */
@@ -1457,10 +1947,10 @@ __init_plugin(PurplePlugin *plugin)
     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8");
 #endif
 
-    info.name        = _("Off-the-Record Messaging");
+    info.name        = _("CONIKS Off-the-Record Messaging");
     info.summary     = _("Provides private and secure conversations");
-    info.description = _("Preserves the privacy of IM communications "
-			 "by providing encryption, authentication, "
+    info.description = _("Preserves the security and privacy of IM communications by providing "
+             "automated key management and verification on top of OTR's encryption, authentication, "
 			 "deniability, and perfect forward secrecy.");
 }
 

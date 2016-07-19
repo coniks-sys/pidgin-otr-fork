@@ -30,14 +30,17 @@
 #include <libotr/context.h>
 #include <libotr/userstate.h>
 #include <libotr/instag.h>
+#include <coniks.h>
 
 #define PRIVKEYFNAME "otr.private_key"
 #define STOREFNAME "otr.fingerprints"
 #define INSTAGFNAME "otr.instance_tags"
 #define MAXMSGSIZEFNAME "otr.max_message_size"
+#define CONIKSFNAME "coniks.state"
+#define CONIKSSERVFNAME "coniks.server_params"
 
 extern PurplePlugin *otrg_plugin_handle;
-
+extern ConiksOtrState coniks_state;
 extern OtrlUserState otrg_plugin_userstate;
 
 /* Given a PurpleConversation, return the ConnContext corresponding to the
@@ -83,6 +86,9 @@ void otrg_plugin_send_default_query(ConnContext *context, void *account);
 /* Send the default OTR Query message to the correspondent of the given
  * conversation. */
 void otrg_plugin_send_default_query_conv(PurpleConversation *conv);
+
+/* Performs the coniks continuity checks on the requested user for the current epoch */
+void otrg_plugin_coniks_continuity_checks_buddy(ConnContext *context);
 
 /* Disconnect a context, sending a notice to the other side, if
  * appropriate. */
